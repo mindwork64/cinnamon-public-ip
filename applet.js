@@ -9,6 +9,7 @@ const PopupMenu = imports.ui.popupMenu;
 const Mainloop = imports.mainloop;
 const Gio = imports.gi.Gio;
 const GLib = imports.gi.GLib;
+const Gettext = imports.gettext;
 
 const UUID = "public-ip-cinnamon@mindwork64";
 const IP_URL = "https://l2.io/ip.json";
@@ -16,6 +17,12 @@ const COUNTRY_URL = "https://ipwho.is/";
 const REQUEST_TIMEOUT = 8;
 const FALLBACK_INTERVAL_SECONDS = 30;
 const MIN_REFRESH_GAP_SECONDS = 3;
+
+Gettext.bindtextdomain(UUID, GLib.get_home_dir() + "/.local/share/locale");
+
+function _(text) {
+    return Gettext.dgettext(UUID, text);
+}
 
 let NM = null;
 let nmAvailable = false;
@@ -31,7 +38,7 @@ class PublicIPApplet extends Applet.TextApplet {
     constructor(metadata, orientation, panelHeight, instanceId) {
         super(orientation, panelHeight, instanceId);
         this.set_applet_label("…");
-        this.set_applet_tooltip("Получение публичного IP…");
+        this.set_applet_tooltip(_("Checking public IP…"));
 
         this._ip = null;
         this._country = null;
@@ -43,13 +50,14 @@ class PublicIPApplet extends Applet.TextApplet {
         this._lastNetworkSignature = null;
         this._timerId = 0;
         this._debounceId = 0;
+        this._retryRefreshId = 0;
         this._nmClient = null;
         this._nmSignals = [];
         this._deviceSignals = [];
 
         this._menu = new Applet.AppletPopupMenu(this, orientation);
-        this._statusItem = new PopupMenu.PopupMenuItem("Проверка ещё не выполнялась", { reactive: false });
-        this._refreshItem = new PopupMenu.PopupMenuItem("Обновить сейчас");
+        this._statusItem = new PopupMenu.PopupMenuItem(_("Not checked yet"), { reactive: false });
+        this._refreshItem = new PopupMenu.PopupMenuItem(_("Refresh now"));
         this._refreshItem.connect("activate", () => this._requestRefresh(true));
         this._menu.addMenuItem(this._statusItem);
         this._menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
@@ -58,6 +66,7 @@ class PublicIPApplet extends Applet.TextApplet {
         this._menuManager.addMenu(this._menu);
 
         this._startNetworkMonitoring();
+        this._checkNetworkSignature();
         this._requestRefresh(true);
 
         // Safety net and fallback for VPN implementations not reported by NM.
@@ -76,17 +85,17 @@ class PublicIPApplet extends Applet.TextApplet {
                 throw new Error("NM.Client.new returned null");
 
             this._nmSignals.push([this._nmClient,
-                this._nmClient.connect("device-added", () => this._networkChanged("Добавлено сетевое устройство"))]);
+                this._nmClient.connect("device-added", () => this._networkChanged(_("a network device was added")))]);
             this._nmSignals.push([this._nmClient,
-                this._nmClient.connect("device-removed", () => this._networkChanged("Удалено сетевое устройство"))]);
+                this._nmClient.connect("device-removed", () => this._networkChanged(_("a network device was removed")))]);
             this._nmSignals.push([this._nmClient,
-                this._nmClient.connect("notify::active-connections", () => this._networkChanged("Изменились активные подключения"))]);
+                this._nmClient.connect("notify::active-connections", () => this._networkChanged(_("active connections changed")))]);
 
             this._attachDeviceSignals();
             this._nmSignals.push([this._nmClient,
                 this._nmClient.connect("notify::devices", () => {
                     this._attachDeviceSignals();
-                    this._networkChanged("Изменился список интерфейсов");
+                    this._networkChanged(_("the device list changed"));
                 })]);
         } catch (e) {
             global.logWarning(UUID + ": NetworkManager monitoring failed; timer fallback enabled: " + e);
@@ -104,7 +113,7 @@ class PublicIPApplet extends Applet.TextApplet {
             let devices = this._nmClient.get_devices();
             for (let i = 0; i < devices.length; i++) {
                 let device = devices[i];
-                let id = device.connect("state-changed", () => this._networkChanged("Состояние интерфейса изменилось"));
+                let id = device.connect("state-changed", () => this._networkChanged(_("an interface state changed")));
                 this._deviceSignals.push([device, id]);
             }
         } catch (e) {
@@ -115,7 +124,7 @@ class PublicIPApplet extends Applet.TextApplet {
     _disconnectSignals(items) {
         for (let i = 0; i < items.length; i++) {
             try {
-                if (items[i][0] && items[i][0].handler_is_connected(items[i][1]))
+                if (items[i][0])
                     items[i][0].disconnect(items[i][1]);
             } catch (e) {
                 // Object may already have been destroyed by NetworkManager.
@@ -127,7 +136,7 @@ class PublicIPApplet extends Applet.TextApplet {
     _networkChanged(reason) {
         if (this._removed)
             return;
-        this._statusItem.label.text = reason + " — перепроверка IP…";
+        this._statusItem.label.text = _("Refreshing public IP after %s.").format(reason);
         if (this._debounceId)
             Mainloop.source_remove(this._debounceId);
         this._debounceId = Mainloop.timeout_add_seconds(2, () => {
@@ -137,46 +146,62 @@ class PublicIPApplet extends Applet.TextApplet {
         });
     }
 
-    _getNetworkSignature() {
+    _getNetworkSignature(callback) {
+        let proc;
         try {
-            let file = Gio.File.new_for_path("/sys/class/net");
-            let enumerator = file.enumerate_children("standard::name", Gio.FileQueryInfoFlags.NONE, null);
-            let names = [];
-            let info;
-            while ((info = enumerator.next_file(null)) !== null)
-                names.push(info.get_name());
-            enumerator.close(null);
-            names.sort();
-
-            let states = [];
-            for (let i = 0; i < names.length; i++) {
-                let stateFile = Gio.File.new_for_path("/sys/class/net/" + names[i] + "/operstate");
-                try {
-                    let [ok, bytes] = GLib.file_get_contents(stateFile.get_path());
-                    states.push(names[i] + ":" + bytes.toString().trim());
-                } catch (e) {
-                    states.push(names[i] + ":?");
-                }
-            }
-            return states.join("|");
+            proc = Gio.Subprocess.new(
+                ["ip", "-o", "link", "show"],
+                Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE
+            );
         } catch (e) {
-            global.logWarning(UUID + ": Interface scan failed: " + e);
-            return null;
+            callback(null, _("Could not start ip: %s").format(e));
+            return;
         }
+
+        proc.communicate_utf8_async(null, null, (source, result) => {
+            try {
+                let [ok, stdout, stderr] = source.communicate_utf8_finish(result);
+                if (!ok || source.get_exit_status() !== 0) {
+                    callback(null, (stderr || _("Could not read network interfaces.")).trim());
+                    return;
+                }
+
+                let signature = stdout.split(/\r?\n/)
+                    .filter(line => line.trim().length > 0)
+                    .map(line => {
+                        let match = line.match(/^\d+:\s+([^:@]+)(?:@[^:]+)?:\s+<([^>]*)>/);
+                        if (!match)
+                            return line.trim();
+                        let flags = match[2].split(",").sort().join(",");
+                        return match[1] + ":" + flags;
+                    })
+                    .sort()
+                    .join("|");
+
+                callback(signature, null);
+            } catch (e) {
+                callback(null, String(e));
+            }
+        });
     }
 
     _checkNetworkSignature() {
-        let signature = this._getNetworkSignature();
-        if (signature === null)
-            return;
-        if (this._lastNetworkSignature === null) {
-            this._lastNetworkSignature = signature;
-            return;
-        }
-        if (signature !== this._lastNetworkSignature) {
-            this._lastNetworkSignature = signature;
-            this._networkChanged("Обнаружено изменение сетевых интерфейсов");
-        }
+        this._getNetworkSignature((signature, error) => {
+            if (this._removed)
+                return;
+            if (error) {
+                global.logWarning(UUID + ": Interface scan failed: " + error);
+                return;
+            }
+            if (this._lastNetworkSignature === null) {
+                this._lastNetworkSignature = signature;
+                return;
+            }
+            if (signature !== this._lastNetworkSignature) {
+                this._lastNetworkSignature = signature;
+                this._networkChanged(_("network interfaces changed"));
+            }
+        });
     }
 
     _runCurl(url, callback) {
@@ -189,14 +214,14 @@ class PublicIPApplet extends Applet.TextApplet {
                 Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE
             );
         } catch (e) {
-            callback(null, "Не удалось запустить curl: " + e);
+            callback(null, _("Could not start curl: %s").format(e));
             return;
         }
         proc.communicate_utf8_async(null, null, (source, result) => {
             try {
                 let [ok, stdout, stderr] = source.communicate_utf8_finish(result);
                 if (!ok || source.get_exit_status() !== 0) {
-                    callback(null, (stderr || "HTTP-запрос завершился с ошибкой").trim());
+                    callback(null, (stderr || _("The HTTP request failed.")).trim());
                     return;
                 }
                 callback(stdout, null);
@@ -210,33 +235,44 @@ class PublicIPApplet extends Applet.TextApplet {
         if (this._removed)
             return;
         let now = GLib.get_monotonic_time() / 1000000;
-        if (!force && now - this._lastRefresh < MIN_REFRESH_GAP_SECONDS)
+        let elapsed = now - this._lastRefresh;
+        if (!force && elapsed < MIN_REFRESH_GAP_SECONDS) {
+            if (!this._retryRefreshId) {
+                let delay = Math.max(1, Math.ceil(MIN_REFRESH_GAP_SECONDS - elapsed));
+                this._retryRefreshId = Mainloop.timeout_add_seconds(delay, () => {
+                    this._retryRefreshId = 0;
+                    this._requestRefresh(true);
+                    return GLib.SOURCE_REMOVE;
+                });
+            }
             return;
+        }
         if (this._busy) {
             this._refreshAgain = true;
             return;
         }
         this._busy = true;
         this._lastRefresh = now;
-        this._statusItem.label.text = "Получение публичного IP…";
+        this._statusItem.label.text = _("Checking public IP…");
 
         this._runCurl(IP_URL, (body, error) => {
             if (this._removed)
                 return;
             if (error) {
-                this._finishWithError("Ошибка получения IP: " + error);
+                this._finishWithError(_("Could not retrieve the public IP: %s").format(error));
                 return;
             }
             let data;
             try {
                 data = JSON.parse(body);
             } catch (e) {
-                this._finishWithError("l2.io вернул некорректный JSON");
+                this._finishWithError(_("l2.io returned invalid JSON."));
                 return;
             }
             let ip = data && typeof data.ip === "string" ? data.ip.trim() : "";
-            if (!ip || !/^[0-9a-fA-F:.]+$/.test(ip)) {
-                this._finishWithError("В ответе l2.io отсутствует корректный IP");
+            let address = ip ? Gio.InetAddress.new_from_string(ip) : null;
+            if (!address) {
+                this._finishWithError(_("The l2.io response did not contain a valid IP address."));
                 return;
             }
             this._lookupCountry(ip);
@@ -253,22 +289,25 @@ class PublicIPApplet extends Applet.TextApplet {
                 this._countryCode = null;
                 this._busy = false;
                 this._render();
-                this._statusItem.label.text = "Страна не определена: " + error;
+                this._statusItem.label.text = _("Country lookup failed: %s").format(error);
                 this._runQueuedRefresh();
                 return;
             }
             try {
                 let data = JSON.parse(body);
                 if (data.success === false)
-                    throw new Error(data.message || "Сервис геолокации отклонил запрос");
+                    throw new Error(data.message || _("The geolocation service rejected the request."));
                 this._ip = ip;
                 this._country = data.country || null;
                 this._countryCode = data.country_code || null;
                 this._busy = false;
                 this._render();
-                this._statusItem.label.text = this._country
-                    ? "Страна: " + this._country + (this._countryCode ? " (" + this._countryCode + ")" : "")
-                    : "Страна не определена";
+                if (this._country && this._countryCode)
+                    this._statusItem.label.text = _("Country: %s (%s)").format(this._country, this._countryCode);
+                else if (this._country)
+                    this._statusItem.label.text = _("Country: %s").format(this._country);
+                else
+                    this._statusItem.label.text = _("Country unknown.");
                 this._runQueuedRefresh();
             } catch (e) {
                 this._ip = ip;
@@ -276,7 +315,7 @@ class PublicIPApplet extends Applet.TextApplet {
                 this._countryCode = null;
                 this._busy = false;
                 this._render();
-                this._statusItem.label.text = "IP получен, но страну разобрать не удалось";
+                this._statusItem.label.text = _("The IP address was retrieved, but the country response could not be parsed.");
                 this._runQueuedRefresh();
             }
         });
@@ -284,8 +323,12 @@ class PublicIPApplet extends Applet.TextApplet {
 
     _finishWithError(message) {
         this._busy = false;
-        this.set_applet_label("IP: —");
-        this.set_applet_tooltip(message);
+        if (this._ip)
+            this._render();
+        else {
+            this.set_applet_label(_("IP unavailable"));
+            this.set_applet_tooltip(message);
+        }
         this._statusItem.label.text = message;
         this._runQueuedRefresh();
     }
@@ -312,18 +355,18 @@ class PublicIPApplet extends Applet.TextApplet {
 
     _render() {
         if (!this._ip) {
-            this.set_applet_label("IP: —");
-            this.set_applet_tooltip("Публичный IP пока не получен");
+            this.set_applet_label(_("IP unavailable"));
+            this.set_applet_tooltip(_("Public IP is not available yet."));
             return;
         }
         let flag = this._flagEmoji(this._countryCode);
         this.set_applet_label((flag ? flag + " " : "") + this._ip);
-        let tooltip = "Публичный IP: " + this._ip;
+        let tooltip = _("Public IP: %s").format(this._ip);
         if (this._country)
-            tooltip += "\nСтрана: " + this._country;
+            tooltip += "\n" + _("Country: %s").format(this._country);
         if (this._countryCode)
-            tooltip += "\nКод страны: " + this._countryCode;
-        tooltip += "\nИсточник IP: l2.io";
+            tooltip += "\n" + _("Country code: %s").format(this._countryCode);
+        tooltip += "\n" + _("IP source: l2.io");
         this.set_applet_tooltip(tooltip);
     }
 
@@ -337,6 +380,8 @@ class PublicIPApplet extends Applet.TextApplet {
             Mainloop.source_remove(this._timerId);
         if (this._debounceId)
             Mainloop.source_remove(this._debounceId);
+        if (this._retryRefreshId)
+            Mainloop.source_remove(this._retryRefreshId);
         this._disconnectSignals(this._nmSignals);
         this._disconnectSignals(this._deviceSignals);
         if (this._menu)

@@ -1,0 +1,8 @@
+{
+  "uuid": "public-ip-cinnamon@mindwork64",
+  "name": "Public IP",
+  "description": "Shows the public IP address and its country using l2.io",
+  "icon": "network-transmit-receive",
+  "version": "1.0.0",
+  "max-instances": 1
+}
